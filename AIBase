@@ -1,0 +1,1029 @@
+local ServerScriptService = game:GetService("ServerScriptService")
+local PathfindingService = game:GetService("PathfindingService")
+
+local AIHelper = require(ServerScriptService.NewAI.AIHelper)
+
+local Storage = _G.CORE.STORAGE
+local WeaponData = _G.CORE.SHARED["Weapon.Data"]
+local CombatService = _G.CORE.SERVICES["Combat.Service"]
+local HitDetectionService = _G.CORE.SERVICES["HitDetection.Service"]
+
+local BaseAI = {}
+local ActionBlockers = {
+	-- Means they cant do anything at all
+	AnyAction = { "Stun", "TrueStun", "SystemStun", "Knocked", "Ragdolled" },
+	Attack = { "Stun", "Parrying", "Parried", "Attacking", "iFrame" },
+	Dash = { "DashCD", "Attacking", "Stun", "TrueStun", "SelfStun" },
+	-- i gotta figure out parry stun
+	Parry = {},
+}
+
+BaseAI.ANIMATION_PRIORITIES = {
+	Movement = 1, -- walking Dashing ect
+	Combat = 2, -- This is for Combat like M1, m2, blocking ect..
+	Status = 3, -- would be like Being gripped or carried Stunned ect
+	Override = 4, -- Overides all other animations
+}
+
+--- This will be overridden by subclasses when i set it up
+BaseAI.ANIMATION_MAPPINGS = {
+
+	Movement = {
+		WeaponRun = "",
+		Run = "",
+		Walk = "",
+		DashForward = "",
+		DashBack = "",
+		DashLeft = "",
+		DashRight = "",
+	},
+	Combat = {
+		M2 = "",
+		Holding = "",
+		Blocking = "",
+		Grip = "",
+		Parry = "",
+		M1_ = "", -- this will have Multiple Animations based on weapon like M1_1 m1_2 ect
+	},
+	Status = {
+		BeingGripped = "",
+		BeingCarried = "",
+		Hit_ = "", -- this will have multiple animations based on AI hit reactions
+	},
+	Override = {
+		--- Anything here will be override and stop any playing animations
+		--- if an animation trys to play when this animation is playing the other one wont play
+	},
+}
+
+BaseAI.__index = BaseAI
+
+--[[
+	BASEAI TODO LIST
+	Make it so Movement stops with damage and status effects ect.. Make sure ai can be stunned JUST what it needs to be add functions for combat that can be overriden ect..
+	Split and orginize flag names ect by putting movment flags in _Flags.Movement and target flags in _Flags.Target maybe idk
+	Make my own pathfinding system roblox shit sucks man 80 ms to compute a path like what?
+]]
+
+--------------------
+-- Initialization --
+--------------------
+
+function BaseAI.new(AIData)
+	local self = setmetatable({}, BaseAI)
+
+	self.Model = AIData.Model
+	self.PrimaryPart = self.Model
+		and (self.Model.PrimaryPart or (self.Model:FindFirstChild("Head") or self.Model:FindFirstOfClass("BasePart")))
+	self.Humanoid = AIData.Humanoid
+	self.State = "Sleeping"
+	self.CurrentWeapon = AIData.CurrentWeapon or nil
+	self.SpawnPosition = AIData.SpawnPosition or Vector3.new(0, 0, 0)
+
+	self.Target = nil
+	self.Combo = 1
+	self._PathInfo = self:_resetPathInfo()
+
+	self.Animations = {
+		_currentlyPlaying = {},
+		_inactiveLoopedAnimations = {},
+	}
+
+	self.Tier = AIData.Tier or 1
+	self._Flags = {
+		isMoving = false,
+		moveDestination = Vector3.new(0, 0, 0),
+		isCreatingPath = false,
+		inCombat = false,
+	}
+	self._Timers = {
+		waypointDeadline = 0,
+		lastUpdate = 0,
+		roamFinishedTime = 0,
+		stuckStartTime = 0,
+		lastFindTarget = 0,
+		totalLoopTime = 0,
+		lastComboTime = 0,
+	}
+
+	self.Config = {
+		-- Temporary hardcoded defaults overrideable and should be in subclasses that inherit BaseAI
+		roamCDTime = 2,
+		roamRange = 60,
+		waypointReachDistance = 7, -- near 7 studs until it moves to new waypoint
+		waypointTimeoutMultiplier = 2,
+		maxPathAttempts = 5,
+		pathTimeout = 4,
+		stuckTimeout = 2,
+		findTargetInterval = 0.3,
+		retryCooldown = 0.3,
+	}
+
+	self._Connections = {}
+
+	-- Backwards combatibilty DONT USE CALL self:_playAnimation()
+	self.PlayAnimation = Instance.new("BindableEvent")
+	self.PlayAnimation.Name = "PlayAnimation"
+	self.PlayAnimation.Parent = self.Model
+
+	-- DONT USE THIS for future cases. This was added here for backwards combatibilty if other scripts outside
+	-- of the ai called PlayAnimation that the old AI Used.
+	self.PlayAnimation.Event:Connect(function(weaponType, animName, shouldPlay)
+		self:_playAnimation(animName, shouldPlay)
+	end)
+	-- setting required folders
+	local NPCMarker = Instance.new("Folder")
+	NPCMarker.Name = "NPC"
+	NPCMarker.Parent = self.Model
+
+	-- setting attributes
+	self.Model:SetAttribute("Attacking", false)
+	self.Model:SetAttribute("Gripping", false)
+	self.Model:SetAttribute("Died", false)
+
+	-- sets up weapon for the ai if ai doesnt have a weaponType does nothing
+	self:_setupWeapon()
+
+	AIHelper.Log("Info", "new", "Base AI created for model:", self.Model and self.Model.Name or "nil")
+
+	return self
+end
+-------------------
+-- State Machine --
+-------------------
+
+function BaseAI:Update(dt)
+	if not self.Model then
+		AIHelper.Log("Error", "Update: Model missing; could not update AI; self:", self)
+		return
+	end
+	if not self.Humanoid then
+		AIHelper.Log("Error", "Update: Humanoid missing; could not update AI; self:", self)
+		return
+	end
+	if self.State == "Dead" then
+		AIHelper.Log("Error", "Update: AI State was Dead; could not update AI; self:", self)
+		return
+	end
+	if self.Humanoid.Health <= 0 then
+		AIHelper.Log("Error", "Update: Humanoid health was <= 0; could not update AI; self:", self)
+		return
+	end
+
+	self._Timers.lastUpdate += dt
+	local updateFrequency = 0.1
+
+	if self._Timers.lastUpdate >= updateFrequency then
+		self:_updateTargets() -- updates target based on LOS ect..
+
+		-- Handles and changes state based on flags ect.
+		self:UpdateState()
+
+		-- This is the master check. If stunned, parried, or in the middle of another action, do nothing else.
+		if not self:canAct() then
+			self:_executeMove(self.PrimaryPart.Position)
+			return
+		end
+
+		--- Decides the action like if it should Dodge or attack ect.. its the combat thing
+		self:_decideAction(dt)
+
+		-- handles what movement to do based on state
+		self:_updateMovement(dt)
+
+		self._Timers.lastUpdate = 0
+	end
+end
+
+function BaseAI:UpdateState()
+	if self.State == "Roaming" then
+		if self.Target then
+			AIHelper.Log("Info", "Decider: Target found, switching from Roaming to Chasing.")
+			self:ChangeState("Chasing")
+		end
+	elseif self.State == "Chasing" then
+		if not self.Target then
+			AIHelper.Log("Info", "Decider: Target lost, switching from Chasing to Roaming.")
+			self:ChangeState("Roaming")
+		end
+	end
+end
+
+-- Handles state changing the state and setting up new state and cleaning up old
+function BaseAI:ChangeState(newState: string)
+	local prevState = self.State
+	local isNewState = newState ~= prevState
+
+	-- if its a new state calls stateEnter else calls stateExit
+	if isNewState then
+		AIHelper.Log("Info", "ChangeState: old state;", prevState, "new state;", newState)
+		-- exits and cleans up old state
+		self:_stateExit(prevState)
+		self.State = newState
+
+		-- enters and setsup new state
+		self:_stateEnter(newState)
+	end
+end
+
+-- handles setting up the new AI State it entered
+function BaseAI:_stateEnter(state: string)
+	AIHelper.Log("Info", "_stateEnter: Entering state:", state)
+	if state == "Roaming" then
+		-- creates and sets a path with random roam location
+		local success = self:_setRoamPath()
+
+		if not success then
+			AIHelper.Log("Warning", "_stateEnter: Failed to set roam path, changing state to Sleeping.")
+			self:ChangeState("Sleeping")
+			return
+		end
+	elseif state == "Chasing" then
+		-- Placeholder for chase state entry logic
+		AIHelper.Log("Info", "_stateEnter: Chase state entered.")
+	end
+end
+
+-- handles cleaning up the "Old" State it was before it gets set to the new state.
+function BaseAI:_stateExit(state: string)
+	AIHelper.Log("Info", "_stateExit: Exiting state:", state)
+	if self.State == "Roaming" or self.State == "Chasing" then
+		self:_resetPathInfo()
+	end
+end
+
+---------------------
+-- State Handlers  --
+---------------------
+
+function BaseAI:_updateAction(dt)
+	-- gets overriden by subclasses
+	warn("_updateAction called from BaseAI")
+end
+
+--- reFactoring pathfinding stuff
+
+function BaseAI:_setPathTo(currentPosition, destination)
+	local path = PathfindingService:CreatePath()
+
+	local success, _errorResult = pcall(function()
+		path:ComputeAsync(currentPosition, destination)
+	end)
+	local successMessage = "computed successfully"
+	local pickedMessage = success and successMessage or "computation failed"
+	local formattedMessage =
+		string.format("Path %s. From %s to %s.", pickedMessage, tostring(currentPosition), tostring(destination))
+	AIHelper.Log("Debug", `_setPathTo: {formattedMessage}`)
+	return success, path
+end
+
+function BaseAI:_followPath()
+	local path = self._PathInfo.Path
+	local timeOnPath = self._PathInfo.TimeOnPath
+	local waypoints = self._PathInfo.Waypoints
+
+	if not path then
+		AIHelper.Log("Warning", "_followPath: Did not have a path.")
+		return "stuck"
+	end
+
+	-- checks if theres any waypoints
+	if not waypoints or next(waypoints) == nil then
+		if not timeOnPath or os.clock() - timeOnPath > self.Config.pathTimeout then
+			AIHelper.Log("Warning", "_followPath: Path timeout, no waypoints.", `timeOnPath is {timeOnPath}`)
+			-- TODO: CHANGE STATE HERE PROBABLY LATER?
+		end
+		return "stuck"
+	end
+
+	local currentIndex = self._PathInfo.WaypointIndex
+	local currentWaypoint = self._PathInfo.CurrentWaypoint
+	-- checks if candidateWaypoint is valid by checking if currentIndex is a valid number in waypoints
+
+	-- checks if AI has a waypoint
+	if not currentWaypoint then
+		--- checks if the the current currentIndex is a valid waypoint inside waypoints
+		local waypointCandidate = waypoints[currentIndex]
+
+		if not waypointCandidate then
+			AIHelper.Log("Info", "_followPath: Finished current path, currentIndex was", currentIndex)
+			AIHelper.WaypointUpdated("Finished", currentIndex)
+			return "finished"
+		end
+
+		self._Timers.stuckStartTime = 0
+		self._Timers.waypointDeadline = 0
+		self._PathInfo.CurrentWaypoint = waypointCandidate
+		local distanceUntilWaypoint = self:_distanceBetween(self.PrimaryPart, waypointCandidate.Position)
+		self:_executeMove(waypointCandidate.Position)
+		self:_setWaypointDeadline(distanceUntilWaypoint)
+		return "in_progress"
+	end
+
+	local distanceUntilWaypoint = self:_distanceBetween(self.PrimaryPart, currentWaypoint.Position)
+
+	-- check if they are within self.Config.waypointReachDistance (6) studs of the waypoint if its true they reached waypoint
+	if distanceUntilWaypoint <= self.Config.waypointReachDistance then
+		AIHelper.Log("Debug", "_followPath: Reached waypoint", currentIndex)
+		AIHelper.WaypointUpdated("Reached", currentIndex)
+		-- increments the currentIndex by 1
+		self._PathInfo.WaypointIndex += 1
+
+		-- sets currentWaypoint to nil
+		self._PathInfo.CurrentWaypoint = nil
+
+		-- resets stuck timer if it was stuck?
+		self._Timers.stuckStartTime = 0
+
+		-- resets waypointDeadline
+		self._Timers.waypointDeadline = 0
+
+		return "in_progress"
+	end
+
+	-- checking if ai has been on the waypoint longer then (os.clock + timeout) waypointDeadline
+	if os.clock() > self._Timers.waypointDeadline then
+		-- starts stuckStartTime
+		if not self._Timers.stuckStartTime or self._Timers.stuckStartTime == 0 then
+			self._Timers.stuckStartTime = os.clock()
+		end
+
+		local timeStuck = os.clock() - (self._Timers.stuckStartTime or 0)
+		--checking if The AI has been stuck for longer then what the timeout is
+		if timeStuck >= self.Config.stuckTimeout then
+			AIHelper.Log(
+				"Warning",
+				"_followPath: Stuck for",
+				timeStuck,
+				"seconds. StuckTimeout is",
+				self.Config.stuckTimeout
+			)
+			return "stuck"
+		end
+	end
+	return "in_progress"
+end
+
+function BaseAI:_updateRoaming()
+	if self._Timers.roamFinishedTime and os.clock() - self._Timers.roamFinishedTime < self.Config.roamCDTime then
+		AIHelper.Log("Debug", "_updateRoaming: Waiting for roam cooldown...")
+		return
+	else
+		self._Timers.roamFinishedTime = nil
+	end
+
+	if not self:canAct() then
+		warn("Is stunned called from updateRoaming")
+		self:_executeMove(self.PrimaryPart.Position)
+		return
+	end
+
+	local pathStatus = self:_followPath()
+
+	if pathStatus == "in_progress" then
+		AIHelper.Log("Debug", "Roaming in progress.")
+		-- nothing for rn?
+	elseif pathStatus == "finished" then
+		AIHelper.Log("Info", "_updateRoaming: Path finished.")
+		local finishTime = os.clock()
+		-- resets the path info
+		self:_resetPathInfo()
+
+		-- set Time when ai finished roaming
+		self._Timers.roamFinishedTime = finishTime
+	elseif pathStatus == "stuck" then
+		AIHelper.Log("Warning", "_updateRoaming: Path resulted in 'stuck'.")
+		-- resets pathInfo
+		self:_resetPathInfo()
+		self.Config.stuckTimeout = 0
+
+		if not self._Timers.retryRoam or os.clock() - self._Timers.retryRoam >= self.Config.retryCooldown then
+			self._Timers.retryRoam = os.clock()
+			-- Attempts to remake the path.
+			local success = self:_setRoamPath()
+			AIHelper.Log("Info", "_updateRoaming: Stuck, retrying path. Success:", success)
+			if not success then
+				-- if the path couldnt be remade then changes state to sleeping for rn?
+				AIHelper.Log(
+					"Error",
+					"_updateRoaming: Could not generate new path after being stuck. Changing state to Sleeping."
+				)
+				self:ChangeState("Sleeping")
+				return
+			end
+		end
+	end
+end
+
+function BaseAI:_updateChasing() end
+
+function BaseAI:_updateMovement(dt)
+	if self.State == "Roaming" then
+		self:_updateRoaming(dt)
+	elseif self.State == "Chasing" then
+		self:_updateChasing()
+	end
+end
+
+-- gets called when AI should be moved to a new location.
+function BaseAI:_executeMove(destination: Vector3)
+	if not destination then
+		AIHelper.Log("Warning", "_executeMove: did not have destination")
+		return
+	end
+
+	if typeof(destination) ~= "Vector3" then
+		AIHelper.Log("Warning", "_executeMove: wrong type got", typeof(destination))
+		return
+	end
+
+	self._Flags.moveDestination = destination
+	self.Humanoid:MoveTo(destination)
+	AIHelper.Log("Info", "_executeMove: Moving to", destination)
+end
+-----------------------------
+-- Target/Enemy Detection  --
+-----------------------------
+
+function BaseAI:_updateTargets()
+	if os.clock() - self._Timers.lastFindTarget >= self.Config.findTargetInterval then
+		self._Timers.lastFindTarget = os.clock()
+		AIHelper.Log("Debug", "--- Target Check Start --- Current Target:", self.Target and self.Target.Name or "None")
+
+		-- 1. Does ai have a target?
+		if self.Target then
+			-- 1.1 should Ai keep currentTarget?
+			if not self:_shouldKeepTarget(self.Target) then
+				AIHelper.Log("Info", "_shouldKeepTarget returned false. Forgetting target:", self.Target.Name)
+				self:SetTarget(nil)
+			else
+				AIHelper.Log("Debug", "_shouldKeepTarget returned true. Keeping target:", self.Target.Name)
+			end
+		end
+
+		-- 2. Calls findTarget which returns all the valid target in AI LOS
+		local targetCandidate = self:_findTarget() -- handles closest target in there might switch later
+		-- 2.2 Checks findTarget returns a target or not
+		if targetCandidate then
+			AIHelper.Log("Debug", "_findTarget found a candidate:", targetCandidate.Name)
+
+			-- sets the targetCanditate as the new Target if i dont have a target or if i have a target and the targetCandidate isnt my current Target <- Higher priority thats why
+			if not self.Target or self.Target and self.Target ~= targetCandidate then
+				AIHelper.Log("Info", "Switching target to new candidate:", targetCandidate.Name)
+
+				self:SetTarget(targetCandidate)
+			end
+
+			self:_resetPathInfo()
+			local targetPrimaryPart = targetCandidate.PrimaryPart
+			self._Flags.hasLos = true -- since someone is in my los set hasLos to true
+
+			self._Flags.lastKnownPosition = targetPrimaryPart.Position -- saves their position when targetCandidate returned something
+			self._Timers.lastSeenTarget = os.clock() -- saves the time when i seen a target
+		else
+			-- no targetCandidate so no one is in LOS. I might have a target still because of above
+			self._Flags.hasLos = false
+		end
+		AIHelper.Log(
+			"Debug",
+			"--- Target Check End --- Final Target:",
+			self.Target and self.Target.Name or "None",
+			"HasLOS:",
+			self._Flags.hasLos
+		)
+	end
+end
+
+-- Setter: Sets self.Target to newTarget if they are different
+function BaseAI:SetTarget(newTarget: Model)
+	-- checks if newTarget is self.Target
+	if newTarget == self.Target then
+		AIHelper.Log("Debug", "SetTarget: Returned early, target was already set.")
+		-- returns
+		return nil
+	end
+
+	local oldTarget = self.Target
+	local oldTargetName = tostring(oldTarget)
+	local newTargetName = tostring(newTarget)
+
+	AIHelper.Log("Info", "SetTarget: Switching target from", oldTargetName, "to", newTargetName)
+	self.Target = newTarget
+
+	-- since target is different then what current self.target is we reset movment flags and path
+	self:_resetPathInfo()
+	self._Flags.moveDestination = nil
+
+	return
+end
+
+function BaseAI:_findTarget(): Model? | nil
+	AIHelper.Log("Warning", "_findTarget: Base function called. Subclasses should override this.")
+	-- Handles target detection. Intended for subclasses, returns either Model or nil. Model being the target.
+	return nil
+end
+
+function BaseAI:_shouldKeepTarget(target): boolean
+	-- returns true/false based on if target is valid or not. Intended for subclasses.
+	return false
+end
+
+function BaseAI:_shouldLookForEnemies(): boolean
+	-- returns true/false if this AI Type looks for enemies. Intended for subclasses.
+	return false
+end
+
+-----------------------
+-- Attacking Logic --
+-----------------------
+
+-- This function is the main entry point. It should not be overridden.
+function BaseAI:canAct(actionName): boolean
+	-- Universal checks that apply to ALL AIs
+	if not self.Humanoid or self.Humanoid.Health <= 0 then
+		AIHelper.Log("Debug", "canAct: false, humanoid is dead or missing.")
+		return false
+	end
+
+	for _, statusName in ipairs(ActionBlockers.AnyAction) do
+		if self.Model:FindFirstChild(statusName) or self.Model:GetAttribute(statusName) then
+			AIHelper.Log("Debug", "canAct: action blocked by", statusName)
+			return false
+		end
+	end
+
+	local statusList = ActionBlockers[actionName]
+
+	if not statusList and actionName ~= nil then
+		AIHelper.Log("Warning", ("canAct: no actionBlockers defined for '%s'"):format(actionName))
+		return false
+	end
+
+	if statusList then
+		AIHelper.Log("Debug", "canAct: Checking statusList for", actionName)
+
+		for _, statusName in ipairs(statusList) do
+			if self.Model:FindFirstChild(statusName) or self.Model:GetAttribute(statusName) then
+				AIHelper.Log("Debug", "canAct: action blocked by", statusName)
+				return false
+			end
+		end
+	end
+
+	return true
+end
+
+-- Main attacking function
+function BaseAI:BeginAttack(attackKey: string)
+	if not self:canAct("Attack") then
+		AIHelper.Log("Debug", "BeginAttack: cannot attack due to status effects.")
+		return
+	end
+	if not self.weaponData then
+		AIHelper.Log("Warning", "BeingAttack: weaponData doesnt exit?")
+		return
+	end
+
+	if not attackKey then
+		AIHelper.Log("Warning", "BeginAttack: No attackKey provided.")
+		return
+	end
+
+	if self._Timers.lastComboTime > 0 and os.clock() - self._Timers.lastComboTime >= 2.3 then
+		warn("It has been longer then 2.3 seconds ~reset combo")
+		self.Combo = 1
+	end
+
+	local currentCombo = self.Combo
+	local maxCombo = self.weaponData.MaxCombo
+
+	local comboToString = tostring(currentCombo)
+	local animName = "M1_" .. currentCombo
+
+	self:_playAnimation(animName, true)
+	self.Model:SetAttribute("Attacking", true)
+
+	local attackDelay = self.weaponData.M1Delays[comboToString] or 0.5
+	task.delay(attackDelay, function()
+		self.Model:SetAttribute("Attacking", false)
+	end)
+
+	self._Timers.lastComboTime = os.clock()
+	if currentCombo < maxCombo then
+		self.Combo += 1
+		AIHelper.AddStatusEffect(self.Model, "Stun", self.weaponData.M1Stuns[comboToString])
+	else
+		self.Combo = 1
+		AIHelper.AddStatusEffect(self.Model, "TrueStun", self.weaponData.EndLag)
+	end
+end
+
+function BaseAI:processHit() end
+
+-----------------------
+-- Pathfinding Logic --
+-----------------------
+
+function BaseAI:_setRoamPath(attempt: number? | nil): boolean
+	-- Handles creating a path for roaming
+
+	local attemptNumber: number = attempt or 1
+
+	AIHelper.Log("Debug", "_setRoamPath: attempt", attemptNumber)
+	if attemptNumber > self.Config.maxPathAttempts then
+		AIHelper.Log("Error", "_setRoamPath: MaxPathAttempts reached, failing.")
+		return false
+	end
+
+	local currentPosition = self.PrimaryPart.Position
+	local roamVector = self:_getRandomPointInCircle(currentPosition, self.Config.roamRange, true)
+
+	local success, path = self:_setPathTo(currentPosition, roamVector)
+
+	if success and path.Status == Enum.PathStatus.Success then
+		self._PathInfo.Path = path
+		self._PathInfo.TimeOnPath = os.clock()
+		self._PathInfo.Waypoints = path:GetWaypoints()
+		self._PathInfo.WaypointIndex = 2
+		AIHelper.ShowWaypoints(self._PathInfo.Waypoints)
+		AIHelper.Log("Info", "_setRoamPath: Success, waypoints set.")
+		return true
+	else
+		AIHelper.Log("Warning", "_setRoamPath: Failed to computeAsync, retrying.")
+		return self:_setRoamPath(attemptNumber + 1)
+	end
+end
+
+function BaseAI:_setChasePath()
+	AIHelper.Log("Warning", "_setChasePath: Base function called, no action taken. Subclasses should override.")
+	-- Intentionally empty.
+	-- Subclasses should override if they use chasing behavior.
+end
+
+function BaseAI:_resetPathInfo()
+	-- resets PathInfo table back to default
+	self._PathInfo = {
+		Path = nil,
+		Waypoints = nil,
+		CurrentWaypoint = nil,
+		WaypointIndex = 1,
+		TimeOnPath = 0,
+	}
+	AIHelper.Log("Info", "_resetPathInfo", "Path info reset.")
+	return self._PathInfo
+end
+
+function BaseAI:_setWaypointDeadline(waypointDistance)
+	--// Sets time allowed to reach a waypoint //
+
+	if not waypointDistance then
+		AIHelper.Log("Warning", "_setWaypointDeadline: waypointDistance was nil.")
+		return
+	end
+
+	local expectedTime = waypointDistance / (self.Humanoid and self.Humanoid.WalkSpeed or 16)
+	local timeout = expectedTime * self.Config.waypointTimeoutMultiplier
+	AIHelper.Log("Debug", "_setWaypointDeadline: Set deadline to", timeout, "seconds from now.")
+	self._Timers.waypointDeadline = os.clock() + timeout
+end
+
+-----------------
+-- Utilities   --
+-----------------
+
+function BaseAI:_loadAnimation(animationName: string, animationID: string): AnimationTrack
+	local animation = Instance.new("Animation")
+	animation.Name = animationName
+	animation.AnimationId = animationID
+
+	local animator = self.Humanoid.Animator
+
+	local loadedAnim = animator:LoadAnimation(animation)
+	return loadedAnim
+end
+
+function BaseAI:_loadAnimations()
+	for priority, animations in pairs(self.ANIMATION_MAPPINGS) do
+		self.Animations[priority] = self.Animations[priority] or {}
+		for animName, animId in pairs(animations) do
+			if animId and animId ~= "" then
+				local animation = self:_loadAnimation(animName, animId)
+
+				self.Animations[priority][animName] = animation
+				AIHelper.Log("Info", "_loadAnimations: Loaded animation", animName, "Priority:", priority)
+			else
+				AIHelper.Log("Debug", "_loadAnimations: No AnimationId for", animName, "Priority:", priority)
+			end
+		end
+	end
+end
+
+function BaseAI:_getPlayingAnimations()
+	return self.Animations._currentlyPlaying
+end
+
+function BaseAI:_getPriorityNumber(priorityCatagory): number | nil
+	if not priorityCatagory then
+		return nil
+	end
+
+	local priorityNum = self.ANIMATION_PRIORITIES[priorityCatagory]
+	return priorityNum
+end
+
+function BaseAI:_getAnimationPriority(animationName: string): string
+	for priority, animationList in pairs(self.Animations) do
+		if priority ~= "_currentlyPlaying" then
+			if animationList[animationName] then
+				return priority
+			end
+		end
+	end
+	return "N/A"
+end
+
+function BaseAI:_isHigherPriorityAnimation(animationName: string, priorityToCompare: string): boolean
+	local animPriority = self:_getAnimationPriority(animationName)
+	local animPriorityNum = self.ANIMATION_PRIORITIES[animPriority] or 0
+	local comparePriorityNum = self.ANIMATION_PRIORITIES[priorityToCompare] or 0
+
+	return animPriorityNum > comparePriorityNum
+end
+
+function BaseAI:_getAnimationTrack(animationName: string): AnimationTrack | nil
+	local priority = self:_getAnimationPriority(animationName)
+	if priority ~= "N/A" and self.Animations[priority] then
+		return self.Animations[priority][animationName]
+	end
+	return nil
+end
+
+function BaseAI:_createAnimationData(animationName: string, track: Animation, priority: string)
+	return {
+		animationName = animationName,
+		track = track,
+		priority = priority,
+		lastPlayed = os.clock(),
+		animationConnection = nil,
+	}
+end
+
+function BaseAI:_shouldIgnoreInactiveRestore(): boolean
+	-- Default should never ignore this is for subclasses
+	return false
+end
+
+-- TODO: Finish this when i get back on later!
+function BaseAI:_restoreInactiveAnimations()
+	local inactiveAnimations = self.Animations._inactiveLoopedAnimations
+
+	-- if self:_shouldIgnoreInactiveRestore() then
+	-- 	return
+	-- end
+
+	-- exits early if nothing in inactive Table
+	if next(inactiveAnimations) == nil then
+		return
+	end
+
+	local lastPriority = nil
+	local lastPriortyNum = nil
+	local animationToRestore = nil
+	-- loops through the inactiveAnimations so it can compare and find the highest priority of which looped animation to play
+	for animationName, animationData in pairs(inactiveAnimations) do
+		local currentPriority = animationData.priority
+		local currentPriorityNum = self:_getPriorityNumber(animationData.priority)
+
+		if lastPriority then
+			if lastPriortyNum > currentPriorityNum then
+				-- TODO: I might compare the lastPlayed time so it plays the most recent stopped animation that was looped
+				continue
+			end
+		end
+
+		-- setting lastPriority and lastPriorityNum  so the loop actually has something to compare to
+		lastPriority = currentPriority
+		lastPriortyNum = currentPriorityNum
+
+		animationToRestore = animationName
+	end
+
+	-- going to exit early here just because now im going to play the animation,
+	if not animationToRestore then
+		return
+	end
+
+	self.Animations._inactiveLoopedAnimations[animationToRestore] = nil
+	self:_playAnimation(animationToRestore, true)
+end
+
+-- Plays or stops an animation based on currentWeapon(weaponType), animationName(animName), shouldPlay(true/false)
+function BaseAI:_playAnimation(animationName, shouldPlay)
+	AIHelper.Log("Info", "_playAnimation shouldPlay Animation {" .. animationName .. "} " .. tostring(shouldPlay))
+	local animationPriority: string = self:_getAnimationPriority(animationName)
+	local currentlyPlaying = self:_getPlayingAnimations()
+
+	if animationPriority == "N/A" then
+		AIHelper.Log("Warning", "Animation priority was not found for animation:", animationName)
+		return
+	end
+
+	if shouldPlay then
+		-- Exits early since animation is already playing.
+		if currentlyPlaying[animationName] then
+			warn("animation is already playing", animationName, currentlyPlaying)
+			return
+		end
+
+		local newPriorityNum = self.ANIMATION_PRIORITIES[animationPriority] or 0
+		local animationsToStop = {}
+		for playingAnimation, animData in pairs(currentlyPlaying) do
+			local playingPriorityNumber = self.ANIMATION_PRIORITIES[animData.priority]
+			print("Comparing animation priorty of " .. playingAnimation .. " to " .. animationName)
+			print(playingPriorityNumber, newPriorityNum)
+			if playingPriorityNumber > newPriorityNum then
+				warn("I have to stop " .. playingAnimation .. " Priority is higher then " .. animationName)
+				return
+			else
+				table.insert(animationsToStop, playingAnimation)
+			end
+		end
+
+		for _, playingAnimName in ipairs(animationsToStop) do
+			local animationData = currentlyPlaying[playingAnimName]
+			local track: AnimationTrack = animationData.track
+
+			track:Stop()
+			print("Found " .. playingAnimName .. " inside animationsToStop table going to stop and check if its looped")
+			currentlyPlaying[playingAnimName] = nil
+			if track.Looped then
+				print(playingAnimName .. "'s animation is looped going to add to loopedAnimations table")
+				self.Animations._inactiveLoopedAnimations[playingAnimName] = animationData
+			end
+		end
+
+		print("inactiveLoopedAnimations table", self.Animations._inactiveLoopedAnimations)
+		local track: AnimationTrack = self:_getAnimationTrack(animationName)
+		if track then
+			track:Play()
+			local animationData = self:_createAnimationData(animationName, track, animationPriority)
+
+			-- when the animation Stops restore all the old looped animations
+			if not track.Looped then
+				print("Track not looped going call restoreInactiveAnimations")
+				animationData.animationConnection = track.Ended:Once(function()
+					self:_restoreInactiveAnimations()
+				end)
+			end
+
+			currentlyPlaying[animationName] = animationData
+			return
+		end
+
+		return
+	else
+		local animationData = currentlyPlaying[animationName]
+		if animationData then
+			local animationConnection = animationData.animationConnection
+			if animationConnection and animationConnection.Connected then
+				animationConnection:Disconnect()
+			end
+
+			if animationData.track then
+				animationData.track:Stop()
+			end
+
+			self:_restoreInactiveAnimations()
+			currentlyPlaying[animationName] = nil
+		end
+		return
+	end
+end
+
+-- attaches weaponType(modelName) to weldPoint(attachmentPointName)
+function BaseAI:_attachWeapon(modelName: string, attachmentPointName)
+	local weaponStorage = Storage and Storage["Weapon.Models"]
+	if not weaponStorage then
+		AIHelper.Log("Error", "_attachWeapon: storage wasnt init yet?")
+		return
+	end
+
+	local weaponModel = weaponStorage[modelName] and weaponStorage[modelName]:Clone()
+
+	if not weaponModel then
+		AIHelper.Log("Error", "_attachWeapon: could not find weaponModel", modelName)
+		return
+	end
+
+	local weaponWeld = weaponModel:FindFirstChild("ToolWeld")
+	if not weaponWeld then
+		AIHelper.Log("Error", "_attachWeapon: weaponWeld was nil for", weaponModel)
+		return
+	end
+	local attachmentPoint = self.Model:FindFirstChild(attachmentPointName)
+	if not attachmentPoint then
+		AIHelper.Log("Error", "_attachWeapon: attachmentPoint was nil for", tostring(self.Model))
+		return
+	end
+
+	weaponModel.Parent = self.Model
+	weaponModel.Name = "WEAPON"
+	weaponModel.ToolWeld.Part0 = attachmentPoint
+end
+
+function BaseAI:_setupWeapon()
+	local currentWeapon = self.CurrentWeapon or nil
+	local weaponData = currentWeapon and WeaponData[currentWeapon] or nil
+	if not weaponData then
+		AIHelper.Log("Warning", "setupWeapon: could not find weaponData weaponType:", currentWeapon)
+		return
+	end
+
+	-- I know i shouldnt but setting weaponData here. So other methods can access it. I should set this in class init
+	self.weaponData = weaponData
+
+	if not self.Model then
+		AIHelper.Log("Error", "setupWeapon: AI did not have model")
+		return
+	end
+
+	local isTwoHanded = weaponData.TwoHanded
+
+	AIHelper.Log(
+		"Debug",
+		"_setupWeapon: currentWeapon:",
+		currentWeapon,
+		"isTwoHanded:",
+		isTwoHanded,
+		"weaponData:",
+		weaponData
+	)
+
+	-- checks if weapon is twoHanded
+	if not isTwoHanded then
+		-- sets and attaches weapon to hilt
+		self:_attachWeapon(currentWeapon, "Hilt")
+	else
+		self:_attachWeapon(currentWeapon .. "L", "Left Arm")
+		self:_attachWeapon(currentWeapon .. "R", "Right Arm")
+	end
+end
+
+function BaseAI:_getRandomPointInCircle(center: Vector3, radius: number, useHalfRadius: boolean): Vector3
+	local randomAngle = math.random() * 2 * math.pi
+	radius = radius or 2
+	local halfRadius = math.max(radius / 2, 1)
+	local minDistance = useHalfRadius and halfRadius / 2 or 1
+	local maxDistance = useHalfRadius and halfRadius or radius
+	local randomDistance = math.random() * (maxDistance - minDistance) + minDistance
+
+	local offsetX = math.cos(randomAngle) * randomDistance
+	local offsetZ = math.sin(randomAngle) * randomDistance
+	AIHelper.Log(
+		"Debug",
+		"_getRandomPointInCircle: min, max, actual distance:",
+		minDistance,
+		maxDistance,
+		randomDistance
+	)
+	return center + Vector3.new(offsetX, 0, offsetZ)
+end
+
+function BaseAI:_getRandomVector(xRange, yRange, zRange)
+	local randomX = xRange and math.random(-xRange, xRange) or 0
+	local randomY = yRange and math.random(-yRange, yRange) or 0
+	local randomZ = zRange and math.random(-zRange, zRange) or 0
+	return Vector3.new(randomX, randomY, randomZ)
+end
+
+-- creates a vector3 with a randomX and a randomZ
+function BaseAI:_getRandomRoamPosition()
+	-- gets RoamRange from self.Config is set in .new
+	local roamRange = self.Config.roamRange
+	local randomX = math.random(roamRange, roamRange)
+	local randomZ = math.random(roamRange, roamRange)
+	return Vector3.new(randomX, 0, randomZ)
+end
+
+function BaseAI:_distanceBetween(fromObj, toObj)
+	local fromPos = typeof(fromObj) == "Vector3" and fromObj or fromObj.Position
+	local toPos = typeof(toObj) == "Vector3" and toObj or toObj.Position
+
+	if not fromPos or not toPos then
+		AIHelper.Log("Warning", "_distanceBetween: Could not get position from one of the objects.", fromObj, toObj)
+		return nil
+	end
+
+	return (fromPos - toPos).Magnitude
+end
+
+------------------
+-- Miscellaneous --
+------------------
+
+-- TODO: Finish dying when I make spawn handler probably
+function BaseAI:Died()
+	AIHelper.Log("Info", "Died:", self.Model.Name, "called from BaseAI!")
+end
+
+return BaseAI
