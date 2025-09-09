@@ -1,9 +1,34 @@
+--[[
+	IMPORTANT!!! not finished. Wont be finished for a bit as the game i was making this for doesnt exist anymore
+    BaseAI - Modular AI System
+    
+    Features:
+    - State machine with Roaming/Chasing/Combat states
+    - Pathfinding with stuck detection and retry logic
+    - Priority-based animation system
+    - Status effect blocking system
+    - Weapon attachment system
+    
+    Usage:
+    local myAI = BaseAI.new({
+        Model = npcModel,
+        Humanoid = npcModel.Humanoid,
+        CurrentWeapon = "Sword",
+        Tier = 1
+    })
+    
+    -- Override in subclasses:
+    function MyAI:_findTarget() ... end
+    function MyAI:_shouldKeepTarget() ... end
+]]
+
+
 local ServerScriptService = game:GetService("ServerScriptService")
 local PathfindingService = game:GetService("PathfindingService")
 
 local AIHelper = require(ServerScriptService.NewAI.AIHelper)
 
-local Storage = _G.CORE.STORAGE
+local Storage = _G.CORE.STORAGE --- This is how their game handled their storage.
 local WeaponData = _G.CORE.SHARED["Weapon.Data"]
 local CombatService = _G.CORE.SERVICES["Combat.Service"]
 local HitDetectionService = _G.CORE.SERVICES["HitDetection.Service"]
@@ -58,12 +83,6 @@ BaseAI.ANIMATION_MAPPINGS = {
 
 BaseAI.__index = BaseAI
 
---[[
-	BASEAI TODO LIST
-	Make it so Movement stops with damage and status effects ect.. Make sure ai can be stunned JUST what it needs to be add functions for combat that can be overriden ect..
-	Split and orginize flag names ect by putting movment flags in _Flags.Movement and target flags in _Flags.Target maybe idk
-	Make my own pathfinding system roblox shit sucks man 80 ms to compute a path like what?
-]]
 
 --------------------
 -- Initialization --
@@ -1000,8 +1019,8 @@ end
 function BaseAI:_getRandomRoamPosition()
 	-- gets RoamRange from self.Config is set in .new
 	local roamRange = self.Config.roamRange
-	local randomX = math.random(roamRange, roamRange)
-	local randomZ = math.random(roamRange, roamRange)
+	local randomX = math.random(-roamRange, roamRange)
+	local randomZ = math.random(-roamRange, roamRange)
 	return Vector3.new(randomX, 0, randomZ)
 end
 
