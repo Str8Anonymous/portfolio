@@ -1,25 +1,10 @@
 --[[
-	IMPORTANT!!! not finished. Wont be finished for a bit as the game i was making this for doesnt exist anymore
-    BaseAI - Modular AI System
-    
-    Features:
-    - State machine with Roaming/Chasing/Combat states
-    - Pathfinding with stuck detection and retry logic
-    - Priority-based animation system
-    - Status effect blocking system
-    - Weapon attachment system
-    
-    Usage:
-    local myAI = BaseAI.new({
-        Model = npcModel,
-        Humanoid = npcModel.Humanoid,
-        CurrentWeapon = "Sword",
-        Tier = 1
-    })
-    
-    -- Override in subclasses:
-    function MyAI:_findTarget() ... end
-    function MyAI:_shouldKeepTarget() ... end
+    BaseAI (Core Class)
+    Author: OGStr8 ( Nathaniel )
+    Description:
+      Modular base class for all AI entities.
+      Handles pathfinding, animation control, combat behavior, and target acquisition.
+      Designed to be subclassed for specific enemy types (e.g., BanditAI).
 ]]
 
 
